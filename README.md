@@ -72,7 +72,7 @@ cd mcp_mtproto
 ```
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt -c requirements.lock
+pip install -r requirements.txt
 ```
 
 ### Windows (PowerShell)
@@ -80,10 +80,10 @@ pip install -r requirements.txt -c requirements.lock
 ```
 py -3 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt -c requirements.lock
+pip install -r requirements.txt
 ```
 
-`requirements.lock` — перевірений набір версій. Якщо якась із них не встановлюється на вашій версії Python, виконайте просто `pip install -r requirements.txt`: там версії обмежені сумісними гілками (зокрема `mcp` 1.x — у 2.x сервер не запуститься).
+У `requirements.txt` версії обмежені сумісними гілками (зокрема `mcp` 1.x — у 2.x сервер не запуститься). CI перевіряє чисту установку з цього файлу.
 
 Якщо PowerShell відповідає, що виконання скриптів вимкнене, або виконайте один раз
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, або скористайтеся командним рядком (cmd) і `.venv\Scripts\activate.bat`. Також можна взагалі не активувати середовище, а викликати Python напряму: `.venv\Scripts\python.exe ...`.
@@ -319,7 +319,7 @@ Windows:
 ## Розробка
 
 ```
-pip install -r requirements.txt -r requirements-dev.txt -c requirements.lock
+pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q tests
 ```
 

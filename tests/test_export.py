@@ -11,6 +11,7 @@ import pytest
 from telethon.errors import FloodWaitError
 
 import app.export as e
+import app.server as server
 from app.common import ToolFailure
 from conftest import DATE, HUMAN, message
 
@@ -164,3 +165,101 @@ def test_manager_runs_in_background_and_reports_interrupted():
 def test_job_id_is_validated():
     with pytest.raises(ToolFailure):
         e.load_state("../../etc")
+
+
+@pytest.mark.parametrize("failure,code,status", [
+    (ToolFailure("session_busy", "Session is busy"), "session_busy", "failed"),
+    (RuntimeError("Connection failed"), "export_failed", "failed"),
+    (FloodWaitError(request=None, capture=420), "flood_wait", "paused"),
+])
+def test_resume_reports_connection_failure_and_can_retry(failure, code, status):
+    client = HistoryClient(history(3))
+    svc = type("Svc", (), {"get": AsyncMock(side_effect=failure)})()
+
+    async def go():
+        state = await e.create_job(client, 111)
+        state.update(status="paused", retry_after=10_000, error="Previous FloodWait")
+        e._save(state)
+        mgr = e.ExportManager(svc)
+        result = await mgr.resume(state["job_id"], 5)
+        assert result["status"] == status and result["code"] == code
+        assert result["error"] != "Previous FloodWait"
+        saved = e.load_state(state["job_id"])
+        assert saved["status"] == status and saved["error"] == result["error"]
+        if status == "paused":
+            assert result["retry_after"] == 420
+        else:
+            assert "retry_after" not in result
+            assert str(failure) in result["error"]
+
+        svc.get.side_effect = None
+        svc.get.return_value = client
+        done = await mgr.resume(state["job_id"], 5)
+        assert done["status"] == "complete" and done["messages"] == 3
+        assert "error" not in done and "code" not in done and "retry_after" not in done
+
+    asyncio.run(go())
+
+
+def test_status_list_recovers_orphans_and_preserves_running_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(e, "JOBS_DIR", tmp_path / ".jobs")
+    monkeypatch.setattr(e, "EXPORT_DIR", tmp_path)
+
+    async def go():
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        class BlockingHistory(HistoryClient):
+            async def iter_messages(self, *args, **kwargs):
+                entered.set()
+                await finish.wait()
+                async for m in super().iter_messages(*args, **kwargs):
+                    yield m
+
+        client = BlockingHistory(history(3))
+        svc = type("Svc", (), {"get": AsyncMock(return_value=client)})()
+        mgr = e.ExportManager(svc)
+        monkeypatch.setattr(server, "exports", mgr)
+        orphans = []
+        for status in ("created", "running", "waiting_flood"):
+            state = await e.create_job(client, 111)
+            state.update(status=status, retry_after=120)
+            e._save(state)
+            orphans.append(state["job_id"])
+        live = await mgr.start(0, chat=111)
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            result = await server.export_status()
+            jobs = {s["job_id"]: s for s in result["jobs"]}
+            assert jobs[live["job_id"]]["status"] == "running"
+            for job_id in orphans:
+                assert jobs[job_id]["status"] == "interrupted"
+                assert "retry_after" not in jobs[job_id]
+                assert e.load_state(job_id)["status"] == "interrupted"
+                assert await server.export_status(job_id) == jobs[job_id]
+        finally:
+            finish.set()
+            await mgr.shutdown()
+
+    asyncio.run(go())
+
+
+def test_cli_list_preserves_session_owner_and_recovers_after_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(e, "JOBS_DIR", tmp_path / ".jobs")
+    monkeypatch.setattr(e, "EXPORT_DIR", tmp_path)
+    from app.client import SessionLock
+
+    lock_path = tmp_path / "session.lock"
+    monkeypatch.setattr(e, "SessionLock", lambda: SessionLock(lock_path))
+    state = asyncio.run(e.create_job(HistoryClient([]), 111))
+    state.update(status="waiting_flood", retry_after=120)
+    e._save(state)
+    lock = SessionLock(lock_path)
+    lock.acquire()
+    try:
+        assert e.list_jobs()[0]["status"] == "waiting_flood"
+        assert e.load_state(state["job_id"])["status"] == "waiting_flood"
+    finally:
+        lock.release()
+    result = e.list_jobs()[0]
+    assert result["status"] == "interrupted" and "retry_after" not in result
+    assert e.load_state(state["job_id"])["status"] == "interrupted"

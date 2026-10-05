@@ -2,13 +2,38 @@
 
 import asyncio
 import os
+import runpy
 import stat
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import app.client as c
 from app.common import ToolFailure
+
+
+@pytest.mark.parametrize("configured,override", [(False, False), (True, False), (True, True)])
+def test_data_directory_configuration(tmp_path, monkeypatch, configured, override):
+    # Исполняем копию модуля с отдельным ROOT и настоящим dotenv, не читая .env проекта.
+    source = tmp_path / "app" / "client.py"
+    source.parent.mkdir()
+    source.write_text(Path(c.__file__).read_text(encoding="utf-8"), encoding="utf-8")
+    dotenv_dir = tmp_path / "dotenv-data"
+    external_dir = tmp_path / "external-data"
+    if configured:
+        (tmp_path / ".env").write_text(f'MTPROTO_DATA_DIR={dotenv_dir.as_posix()}\n', encoding="utf-8")
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    monkeypatch.delenv("MTPROTO_DATA_DIR", raising=False)
+    if override:
+        monkeypatch.setenv("MTPROTO_DATA_DIR", str(external_dir))
+
+    config = runpy.run_path(str(source))
+
+    expected = external_dir if override else dotenv_dir if configured else tmp_path / "data"
+    assert config["DATA_DIR"] == expected
+    assert config["SESSION_FILE"] == expected / "session.session"
+    assert config["LOCK_FILE"] == expected / "session.lock"
 
 
 def test_session_lock_is_exclusive(tmp_path):

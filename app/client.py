@@ -29,12 +29,12 @@ from app.flood import retry_on_flood
 log = logging.getLogger("tg-collector")
 
 ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+
 DATA_DIR = Path(os.environ.get("MTPROTO_DATA_DIR") or ROOT / "data")
 SESSION_PATH = DATA_DIR / "session"  # telethon добавит .session сам
 SESSION_FILE = SESSION_PATH.with_suffix(".session")
 LOCK_FILE = DATA_DIR / "session.lock"
-
-load_dotenv(ROOT / ".env")
 
 
 def _require_creds() -> tuple[int, str]:

@@ -1,5 +1,4 @@
 # Верхние границы обязательны: в mcp 2.x нет mcp.server.fastmcp — переход на 2.x отдельной задачей.
-# Проверенный набор версий — requirements.lock (pip install -r requirements.txt -c requirements.lock).
 mcp>=1.30,<2
 telethon>=1.45,<2
 python-dotenv>=1.0,<2

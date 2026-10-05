@@ -41,7 +41,7 @@ from telethon.utils import get_peer_id
 from app import bots
 from app.client import TelegramService, resolve_bot, resolve_entity
 from app.common import ToolFailure, check_range, iso, parse_range
-from app.export import DEFAULT_MAX_MB, DEFAULT_MAX_WORDS, ExportManager, list_jobs
+from app.export import DEFAULT_MAX_MB, DEFAULT_MAX_WORDS, ExportManager
 from app.flood import retry_on_flood
 from app.media import MEDIA_DIR, download_message_media
 
@@ -282,7 +282,7 @@ async def export_status(job_id: str | None = None) -> dict:
     """Статус задания выгрузки (running, waiting_flood, paused, interrupted, cancelled, failed,
     complete) и, когда готово, пути к файлам. Без job_id — список последних заданий."""
     if job_id is None:
-        return {"ok": True, "jobs": list_jobs()}
+        return {"ok": True, "jobs": exports.list_jobs()}
     return exports.status(job_id)
 
 

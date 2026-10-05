@@ -44,7 +44,7 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import Channel, Chat, MessageService, User
 from telethon.utils import get_peer_id
 
-from app.client import DATA_DIR, TelegramService, resolve_entity
+from app.client import DATA_DIR, SessionLock, TelegramService, resolve_entity
 from app.common import ToolFailure, parse_range, read_json, write_json_atomic
 
 log = logging.getLogger("tg-collector")
@@ -203,14 +203,36 @@ def load_state(job_id: str) -> dict:
     return state
 
 
-def list_jobs(limit: int = 20) -> list[dict]:
+def _stored_status(job_id: str) -> dict:
+    """Статус для CLI: исправляем остатки сбоя, только если сессией никто не владеет."""
+    state = load_state(job_id)
+    if state["status"] in _ACTIVE:
+        lock = SessionLock()
+        try:
+            lock.acquire()
+        except ToolFailure as exc:
+            if exc.code != "session_busy":
+                raise
+        else:
+            try:
+                state = load_state(job_id)
+                if state["status"] in _ACTIVE:
+                    state["status"] = "interrupted"
+                    state["retry_after"] = None
+                    _save(state)
+            finally:
+                lock.release()
+    return summary(state)
+
+
+def list_jobs(limit: int = 20, *, status_reader: Callable[[str], dict] = _stored_status) -> list[dict]:
     if not JOBS_DIR.is_dir():
         return []
     ids = sorted((p.name for p in JOBS_DIR.iterdir() if _JOB_ID_RE.match(p.name)), reverse=True)
     out = []
     for job_id in ids[:limit]:
         with suppress(ToolFailure):
-            out.append(summary(load_state(job_id)))
+            out.append(status_reader(job_id))
     return out
 
 
@@ -232,7 +254,7 @@ def summary(state: dict) -> dict:
     if status == "paused":
         out["code"] = "flood_wait"
     if status == "failed":
-        out["code"] = "export_failed"
+        out["code"] = state.get("code") or "export_failed"
     if state.get("retry_after"):
         out["retry_after"] = state["retry_after"]
     if state.get("error"):
@@ -366,6 +388,7 @@ def _mark_complete(state: dict, final_dir: Path) -> None:
         dir=str(final_dir),
         files=[str(final_dir / p["name"]) for p in state["parts"]],
         error=None,
+        code=None,
         retry_after=None,
     )
     _save(state)
@@ -390,7 +413,7 @@ async def run_job(client: TelegramClient, job_id: str, *, max_auto_flood_wait: i
         for f in parts_dir.iterdir():  # части, записанные после последнего сохранения состояния
             if f.name not in known:
                 f.unlink()
-        state.update(status="running", error=None, retry_after=None)
+        state.update(status="running", error=None, code=None, retry_after=None)
         _save(state)
         entity = await resolve_entity(client, state["peer_id"])
 
@@ -419,7 +442,12 @@ async def run_job(client: TelegramClient, job_id: str, *, max_auto_flood_wait: i
         _save(state)
         raise
     except Exception as e:
-        state.update(status="failed", error=e.message if isinstance(e, ToolFailure) else f"{type(e).__name__}: {e}")
+        state.update(
+            status="failed",
+            code=e.code if isinstance(e, ToolFailure) else "export_failed",
+            error=e.message if isinstance(e, ToolFailure) else f"{type(e).__name__}: {e}",
+            retry_after=None,
+        )
         _save(state)
         raise
     log.info("export %s: %s, messages=%d parts=%d", job_id, state["status"], state["messages"], len(state["parts"]))
@@ -453,16 +481,38 @@ class ExportManager:
 
     async def _run(self, job_id: str) -> None:
         try:
-            await run_job(await self._service.get(), job_id)
+            client = await self._service.get()
+        except FloodWaitError as exc:
+            state = load_state(job_id)
+            state.update(status="paused", code=None, retry_after=exc.seconds, error=str(exc))
+            _save(state)
+            return
+        except Exception as exc:
+            state = load_state(job_id)
+            state.update(
+                status="failed",
+                code=exc.code if isinstance(exc, ToolFailure) else "export_failed",
+                error=exc.message if isinstance(exc, ToolFailure) else f"{type(exc).__name__}: {exc}",
+                retry_after=None,
+            )
+            _save(state)
+            log.exception("export %s: getting Telegram client failed", job_id)
+            return
+        try:
+            await run_job(client, job_id)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — статус и текст ошибки уже в state.json
             log.exception("export %s failed", job_id)
 
+    def list_jobs(self, limit: int = 20) -> list[dict]:
+        return list_jobs(limit, status_reader=self.status)
+
     def status(self, job_id: str) -> dict:
         state = load_state(job_id)
         if state["status"] in _ACTIVE and job_id not in self._tasks:
             state["status"] = "interrupted"  # процесс, который его выполнял, завершился
+            state["retry_after"] = None
             _save(state)
         return summary(state)
 
