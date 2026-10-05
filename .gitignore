@@ -6,3 +6,4 @@ logs/
 *.session-journal
 __pycache__/
 .mcp.json
+.pytest_cache/

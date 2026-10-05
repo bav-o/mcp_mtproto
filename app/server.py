@@ -1,9 +1,13 @@
-"""MCP-сервер сбора данных из Telegram: группы/каналы (история, поиск, участники)
+"""MCP-сервер сбора данных из Telegram: группы/каналы (история, поиск, участники, выгрузка)
 и работа с ботами (отправить команду, нажать кнопку, прочитать ответ).
 
-Один Telegram-аккаунт пользователя (Telethon, data/session.session), работает только
-локально на компьютере пользователя. Присоединение к новым публичным каналам — явное действие
-инструмента join_channel, каждый раз логируется.
+Один Telegram-аккаунт пользователя (Telethon, data/session.session), один клиент на процесс
+(TelegramService) с межпроцессной блокировкой сессии. Присоединение к новым каналам — явное
+действие инструмента join_channel, каждый раз логируется.
+
+Ошибки, которые можно исправить (не найдено, неверный аргумент, FloodWait, сессия занята),
+инструменты возвращают единым словарём {"ok": false, "code": ..., "error": ..., ...};
+для FloodWait — с retry_after в секундах.
 
 Запуск (из .mcp.json хост-процессом Claude Code):
     python -m app.server
@@ -11,44 +15,86 @@
 
 from __future__ import annotations
 
-import asyncio
+import functools
 import logging
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from telethon.errors import (
     ChannelPrivateError,
     ChannelsTooMuchError,
     ChatAdminRequiredError,
     FloodWaitError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+    InviteRequestSentError,
     UserAlreadyParticipantError,
-    UsernameInvalidError,
-    UsernameNotOccupiedError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import Channel, Chat, User
 from telethon.utils import get_peer_id
 
-from app.client import DATA_DIR, make_client, session_exists
+from app import bots
+from app.client import TelegramService, resolve_bot, resolve_entity
+from app.common import ToolFailure, check_range, iso, parse_range
+from app.export import DEFAULT_MAX_MB, DEFAULT_MAX_WORDS, ExportManager, list_jobs
 from app.flood import retry_on_flood
+from app.media import MEDIA_DIR, download_message_media
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tg-collector")
 
-mcp = FastMCP("tg-collector")
+telegram = TelegramService()
+exports = ExportManager(telegram)
 
-_BOT_WAIT_TIMEOUT_S = 20
+
+@asynccontextmanager
+async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await exports.shutdown()  # задания сохранят статус interrupted — их можно продолжить
+        await telegram.close()
+
+
+mcp = FastMCP("tg-collector", lifespan=_lifespan)
+
 _MAX_MEDIA_PER_CALL = 50
-_MAX_MEDIA_SIZE_MB = 200
-MEDIA_DIR = DATA_DIR / "media"
+_MAX_MEDIA_SIZE_MB = 1536  # 1,5 ГБ
+_MAX_EXPORT_WAIT_S = 50
 
 
-def _iso(dt: datetime | None) -> str | None:
-    if dt is None:
-        return None
-    return dt.astimezone(timezone.utc).isoformat()
+def _tool(*, read_only: bool, destructive: bool = False, idempotent: bool = False) -> Callable:
+    """@mcp.tool с аннотациями побочных эффектов и единым форматом ожидаемых ошибок."""
+
+    def decorator(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except ToolFailure as e:
+                return e.as_dict()
+            except FloodWaitError as e:
+                return {
+                    "ok": False,
+                    "code": "flood_wait",
+                    "error": f"Telegram ограничил частоту запросов — повторите через {e.seconds} с",
+                    "retry_after": e.seconds,
+                }
+
+        annotations = ToolAnnotations(
+            readOnlyHint=read_only,
+            destructiveHint=destructive,
+            idempotentHint=idempotent,
+            openWorldHint=True,
+        )
+        return mcp.tool(annotations=annotations)(wrapper)
+
+    return decorator
 
 
 def _entity_kind(e: Any) -> str:
@@ -61,343 +107,304 @@ def _entity_kind(e: Any) -> str:
     return "unknown"
 
 
-async def _get_client():
-    if not session_exists():
-        raise RuntimeError(
-            "Сессия не найдена. Сначала выполните вход: "
-            ".venv/bin/python -m app.auth (один раз, руками, спросит код из Telegram)."
-        )
-    client = make_client()
-    await client.connect()
-    if not await retry_on_flood(client.is_user_authorized):
-        await client.disconnect()
-        raise RuntimeError("Сессия протухла или отозвана — повторите вход через app.auth")
-    return client
+def _message_row(m: Any, with_sender: bool = True) -> dict:
+    row: dict[str, Any] = {"id": m.id, "date": iso(m.date), "sender_id": m.sender_id}
+    if with_sender:
+        s = m.sender
+        row["sender"] = (getattr(s, "username", None) or getattr(s, "first_name", None)) if s else None
+    row.update(
+        text=m.message or None,
+        has_media=m.media is not None,
+        media_type=type(m.media).__name__ if m.media else None,
+    )
+    return row
 
 
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-@mcp.tool()
-async def list_dialogs(limit: int = 50) -> list[dict]:
+@_tool(read_only=True, idempotent=True)
+async def list_dialogs(limit: int = 50) -> list[dict] | dict:
     """Список чатов аккаунта: личные, группы, каналы, боты — с id и названием.
 
     Используйте, чтобы узнать точный chat_id/username перед вызовом остальных инструментов.
+    limit — от 1 до 1000.
     """
-    client = await _get_client()
-    try:
-        out = []
-        async for d in client.iter_dialogs(limit=limit):
-            out.append(
-                {
-                    "id": d.id,
-                    "title": d.name,
-                    "username": getattr(d.entity, "username", None),
-                    "kind": _entity_kind(d.entity),
-                    "unread_count": d.unread_count,
-                }
-            )
-        return out
-    finally:
-        await client.disconnect()
+    check_range("limit", limit, 1, 1000)
+    client = await telegram.get()
+    out = []
+    async for d in client.iter_dialogs(limit=limit):
+        out.append(
+            {
+                "id": d.id,
+                "title": d.name,
+                "username": getattr(d.entity, "username", None),
+                "kind": _entity_kind(d.entity),
+                "unread_count": d.unread_count,
+            }
+        )
+    return out
 
 
-@mcp.tool()
+@_tool(read_only=False, idempotent=True)
 async def join_channel(link_or_username: str) -> dict:
     """Присоединиться к публичному каналу/группе по @username или ссылке-приглашению (t.me/+...).
 
     Действие видимое и необратимое без выхода из канала — каждый вызов логируется.
     После этого канал станет доступен в list_dialogs/get_history/search_messages.
     """
-    client = await _get_client()
+    client = await telegram.get()
+    link = link_or_username.strip().split("?")[0].rstrip("/")
     try:
-        link = link_or_username.strip()
-        try:
-            if "joinchat" in link or "/+" in link:
-                invite_hash = link.rstrip("/").split("/")[-1].lstrip("+")
+        if "joinchat/" in link or "/+" in link or link.startswith("+"):
+            invite_hash = link.split("/")[-1].lstrip("+")
+            try:
                 result = await retry_on_flood(lambda: client(ImportChatInviteRequest(invite_hash)))
-                chat = result.chats[0]
-            else:
-                username = link.split("t.me/")[-1].lstrip("@")
-                entity = await client.get_entity(username)
-                await retry_on_flood(lambda: client(JoinChannelRequest(entity)))
-                chat = entity
-            log.info("join_channel: joined %r (id=%s)", getattr(chat, "title", link), chat.id)
-            return {"ok": True, "id": chat.id, "title": getattr(chat, "title", None)}
-        except UserAlreadyParticipantError:
-            entity = await client.get_entity(link.split("t.me/")[-1].lstrip("@"))
-            return {"ok": True, "already_member": True, "id": entity.id, "title": getattr(entity, "title", None)}
-        except (UsernameInvalidError, UsernameNotOccupiedError):
-            return {"ok": False, "error": "канал/username не найден"}
-        except ChannelsTooMuchError:
-            return {"ok": False, "error": "превышен лимит каналов на аккаунт (слишком много подписок)"}
-        except ChannelPrivateError:
-            return {"ok": False, "error": "канал приватный — нужна действующая пригласительная ссылка"}
-    finally:
-        await client.disconnect()
+                chat, already = result.chats[0], False
+            except UserAlreadyParticipantError:
+                # по хэшу ссылки сущность не найти — спрашиваем Telegram, что за чат
+                invite = await retry_on_flood(lambda: client(CheckChatInviteRequest(invite_hash)))
+                chat, already = getattr(invite, "chat", None), True
+                if chat is None:
+                    return {"ok": True, "already_member": True, "id": None, "title": getattr(invite, "title", None)}
+        else:
+            chat = await resolve_entity(client, link.split("t.me/")[-1].lstrip("@"))
+            if not isinstance(chat, Channel):
+                raise ToolFailure("not_a_channel", "это не канал/группа (пользователь или бот)")
+            already = not chat.left
+            if not already:
+                await retry_on_flood(lambda: client(JoinChannelRequest(chat)))
+    except InviteRequestSentError:
+        raise ToolFailure("pending", "заявка на вступление отправлена — ждёт одобрения админа", pending=True) from None
+    except (InviteHashExpiredError, InviteHashInvalidError):
+        raise ToolFailure("invalid_invite", "пригласительная ссылка недействительна или истекла") from None
+    except ChannelsTooMuchError:
+        raise ToolFailure("too_many_channels", "превышен лимит каналов на аккаунт (слишком много подписок)") from None
+    except ChannelPrivateError:
+        raise ToolFailure("private", "канал приватный — нужна действующая пригласительная ссылка") from None
+    if not already:
+        log.info("join_channel: joined %r (id=%s)", getattr(chat, "title", link), chat.id)
+    # id в том же формате, что в list_dialogs (-100…) — его принимают остальные инструменты
+    out = {"ok": True, "id": get_peer_id(chat), "title": getattr(chat, "title", None)}
+    if already:
+        out["already_member"] = True
+    return out
 
 
-@mcp.tool()
+@_tool(read_only=True, idempotent=True)
 async def get_history(
-    chat: str,
+    chat: str | int,
     since: str | None = None,
     until: str | None = None,
     limit: int = 200,
-) -> list[dict]:
-    """История сообщений чата за период.
+    before_id: int | None = None,
+) -> list[dict] | dict:
+    """История сообщений чата за период [since, until), от старых к новым.
 
     chat — id, @username или ссылка t.me/...
-    since/until — ISO-даты ("2026-09-01" или "2026-09-01T00:00:00"), можно опустить любую.
-    limit — не больше стольки сообщений (защита от случайной выгрузки всей истории разом).
+    since/until — ISO-даты ("2026-09-01" или "2026-09-01T00:00:00"), можно опустить любую;
+    since включительно, until — нет.
+    limit — от 1 до 5000 (защита от случайной выгрузки всей истории разом; для всего чата —
+    export_chat_md).
+    before_id — продолжение: только сообщения с id меньше этого (передайте наименьший id
+    из предыдущего ответа, чтобы получить более старые).
     """
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(chat))
-        since_dt, until_dt = _parse_dt(since), _parse_dt(until)
-        out = []
-        async for m in client.iter_messages(entity, limit=limit, offset_date=until_dt, reverse=False):
-            if since_dt and m.date and m.date < since_dt:
-                break
-            out.append(
-                {
-                    "id": m.id,
-                    "date": _iso(m.date),
-                    "sender_id": m.sender_id,
-                    "sender": (getattr(m.sender, "username", None) or getattr(m.sender, "first_name", None)) if m.sender else None,
-                    "text": m.message or None,
-                    "has_media": m.media is not None,
-                    "media_type": type(m.media).__name__ if m.media else None,
-                }
-            )
-        out.reverse()
-        return out
-    finally:
-        await client.disconnect()
+    check_range("limit", limit, 1, 5000)
+    since_dt, until_dt = parse_range(since, until)
+    client = await telegram.get()
+    entity = await resolve_entity(client, chat)
+    out = []
+    kwargs: dict[str, Any] = {"limit": limit, "offset_date": until_dt}
+    if before_id:
+        kwargs["offset_id"] = before_id
+    async for m in client.iter_messages(entity, **kwargs):
+        if since_dt and m.date and m.date < since_dt:
+            break
+        out.append(_message_row(m))
+    out.reverse()
+    return out
 
 
-@mcp.tool()
-async def search_messages(chat: str, query: str, limit: int = 100) -> list[dict]:
-    """Поиск сообщений по ключевым словам внутри одного чата (серверный поиск Telegram)."""
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(chat))
-        out = []
-        async for m in client.iter_messages(entity, search=query, limit=limit):
-            out.append(
-                {
-                    "id": m.id,
-                    "date": _iso(m.date),
-                    "sender_id": m.sender_id,
-                    "text": m.message or None,
-                    "has_media": m.media is not None,
-                    "media_type": type(m.media).__name__ if m.media else None,
-                }
-            )
-        return out
-    finally:
-        await client.disconnect()
+@_tool(read_only=True, idempotent=True)
+async def search_messages(
+    chat: str | int, query: str, limit: int = 100, before_id: int | None = None
+) -> list[dict] | dict:
+    """Поиск сообщений по ключевым словам внутри одного чата (серверный поиск Telegram).
+
+    limit — от 1 до 1000. before_id — продолжение: только сообщения с id меньше этого
+    (наименьший id из предыдущего ответа).
+    """
+    check_range("limit", limit, 1, 1000)
+    client = await telegram.get()
+    entity = await resolve_entity(client, chat)
+    kwargs: dict[str, Any] = {"search": query, "limit": limit}
+    if before_id:
+        kwargs["offset_id"] = before_id
+    return [_message_row(m, with_sender=False) async for m in client.iter_messages(entity, **kwargs)]
 
 
-@mcp.tool()
-async def download_media(chat: str, message_ids: list[int], max_size_mb: int = 25) -> list[dict]:
-    """Скачать фото/файлы из указанных сообщений чата на диск (data/media/<chat_id>/).
+@_tool(read_only=False)
+async def export_chat_md(
+    chat: str | int,
+    since: str | None = None,
+    until: str | None = None,
+    max_words: int = DEFAULT_MAX_WORDS,
+    max_mb: float = DEFAULT_MAX_MB,
+    by_month: bool = False,
+    wait_seconds: int = 20,
+) -> dict:
+    """Выгрузить историю чата в Markdown-файлы на диск, разбив на части. Работает в фоне.
+
+    Готовый результат: data/exports/<chat_id>/<job_id>/<NNN>_<первая дата>_<последняя дата>.md
+    плюс manifest.json. Пока выгрузка не завершена, наружу ничего не публикуется.
+    chat — id, @username или ссылка t.me/...
+    since/until — ISO-даты интервала [since, until), можно опустить (тогда весь чат).
+    max_words/max_mb — лимит на одну часть вместе с заголовком; по умолчанию 400 тыс. слов
+    и 10 МБ — подходит для NotebookLM (до 500 тыс. слов на источник) и Perplexity.
+    Сообщение больше лимита идёт отдельной частью и попадает в oversized_parts.
+    by_month — дополнительно начинать новую часть с каждого месяца.
+    wait_seconds — сколько ждать завершения в этом вызове (0–50). Если не успело —
+    вернётся status=running и job_id: проверяйте export_status(job_id).
+    Возвращает пути к файлам, а не их содержимое — читайте их через Read.
+    Медиа не скачиваются: в файле есть строка 📎 с id сообщения для download_media.
+    """
+    check_range("wait_seconds", wait_seconds, 0, _MAX_EXPORT_WAIT_S)
+    return await exports.start(
+        wait_seconds,
+        chat=chat,
+        since=since,
+        until=until,
+        max_words=max_words,
+        max_mb=max_mb,
+        by_month=by_month,
+    )
+
+
+@_tool(read_only=True, idempotent=True)
+async def export_status(job_id: str | None = None) -> dict:
+    """Статус задания выгрузки (running, waiting_flood, paused, interrupted, cancelled, failed,
+    complete) и, когда готово, пути к файлам. Без job_id — список последних заданий."""
+    if job_id is None:
+        return {"ok": True, "jobs": list_jobs()}
+    return exports.status(job_id)
+
+
+@_tool(read_only=False)
+async def export_resume(job_id: str, wait_seconds: int = 20) -> dict:
+    """Продолжить приостановленную (FloodWait), прерванную, отменённую или упавшую выгрузку
+    с последней готовой части — без повторной обработки уже выгруженных сообщений."""
+    check_range("wait_seconds", wait_seconds, 0, _MAX_EXPORT_WAIT_S)
+    return await exports.resume(job_id, wait_seconds)
+
+
+@_tool(read_only=False)
+async def export_cancel(job_id: str) -> dict:
+    """Отменить выполняющуюся выгрузку. Готовые части сохраняются — её можно продолжить export_resume."""
+    return await exports.cancel(job_id)
+
+
+@_tool(read_only=False, idempotent=True)
+async def download_media(
+    chat: str | int, message_ids: list[int], max_size_mb: int = _MAX_MEDIA_SIZE_MB
+) -> list[dict] | dict:
+    """Скачать фото/видео/аудио/файлы из указанных сообщений чата на диск (data/media/<chat_id>/).
 
     message_ids берите из get_history/search_messages (поле has_media = true).
     Возвращает локальный путь к файлу — его можно открыть через Read (картинки видны).
     Файлы больше max_size_mb пропускаются, не более 50 сообщений за вызов.
+    Повторный запрос берёт файл из кэша, если вложение в Telegram не менялось.
     """
     if not message_ids:
         return []
-    if len(message_ids) > _MAX_MEDIA_PER_CALL:
-        raise ValueError(f"не больше {_MAX_MEDIA_PER_CALL} сообщений за вызов")
-    if not 1 <= max_size_mb <= _MAX_MEDIA_SIZE_MB:
-        raise ValueError(f"max_size_mb должен быть от 1 до {_MAX_MEDIA_SIZE_MB}")
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(chat))
-        target_dir = MEDIA_DIR / str(get_peer_id(entity))
-        target_dir.mkdir(parents=True, exist_ok=True)
-        msgs = await retry_on_flood(lambda: client.get_messages(entity, ids=message_ids))
-        out: list[dict] = []
-        for mid, m in zip(message_ids, msgs):
-            try:
-                if m is None:
-                    out.append({"id": mid, "ok": False, "error": "сообщение не найдено"})
-                    continue
-                if not m.media:
-                    out.append({"id": mid, "ok": False, "error": "в сообщении нет медиа"})
-                    continue
-                size = getattr(getattr(m, "file", None), "size", None)
-                if size is None:
-                    out.append({"id": mid, "ok": False, "error": "размер файла неизвестен (превью ссылки или нестандартное медиа)"})
-                    continue
-                if size > max_size_mb * 1024 * 1024:
-                    out.append({"id": mid, "ok": False, "error": f"файл {size // 1024 // 1024} МБ больше лимита {max_size_mb} МБ"})
-                    continue
-                cached = sorted(p for p in target_dir.glob(f"{mid}.*") if " (" not in p.name)
-                if cached:
-                    path = str(cached[0])
-                else:
-                    path = await retry_on_flood(lambda: client.download_media(m, file=str(target_dir / f"{mid}")))
-                if not path:
-                    out.append({"id": mid, "ok": False, "error": "Telegram не отдал файл (тип медиа не поддерживается)"})
-                    continue
-                log.info("download_media: chat=%s msg=%s -> %s", entity.id, mid, path)
-                out.append({"id": mid, "ok": True, "path": path, "mime": getattr(m.file, "mime_type", None), "size": size})
-            except Exception as e:  # noqa: BLE001 — один сбойный файл не должен терять остальные
-                log.warning("download_media: msg=%s failed: %r", mid, e)
-                out.append({"id": mid, "ok": False, "error": f"{type(e).__name__}: {e}"})
-        return out
-    finally:
-        await client.disconnect()
-
-
-@mcp.tool()
-async def list_participants(chat: str, limit: int = 500) -> list[dict] | dict:
-    """Список участников группы/канала (если список открыт — многие каналы его скрывают)."""
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(chat))
+    check_range("количество message_ids", len(message_ids), 1, _MAX_MEDIA_PER_CALL)
+    check_range("max_size_mb", max_size_mb, 1, _MAX_MEDIA_SIZE_MB)
+    client = await telegram.get()
+    entity = await resolve_entity(client, chat)
+    target_dir = MEDIA_DIR / str(get_peer_id(entity))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    msgs = await retry_on_flood(lambda: client.get_messages(entity, ids=message_ids))
+    out: list[dict] = []
+    for mid, m in zip(message_ids, msgs):
         try:
-            out = []
-            async for u in client.iter_participants(entity, limit=limit):
-                out.append(
-                    {
-                        "id": u.id,
-                        "username": u.username,
-                        "first_name": u.first_name,
-                        "last_name": u.last_name,
-                        "is_bot": u.bot,
-                    }
-                )
-            return out
-        except ChatAdminRequiredError:
-            return {"ok": False, "error": "список участников скрыт — нужны права администратора"}
-    finally:
-        await client.disconnect()
+            if m is None:
+                raise ToolFailure("not_found", "сообщение не найдено")
+            if not m.media:
+                raise ToolFailure("no_media", "в сообщении нет медиа")
+            size = getattr(getattr(m, "file", None), "size", None)
+            if size is None:
+                raise ToolFailure("unknown_size", "размер файла неизвестен (превью ссылки или нестандартное медиа)")
+            if size > max_size_mb * 1024 * 1024:
+                raise ToolFailure("too_large", f"файл {size // 1024 // 1024} МБ больше лимита {max_size_mb} МБ")
+            path, cached = await download_message_media(client, m, target_dir, size)
+            out.append(
+                {"id": mid, "ok": True, "path": str(path), "mime": m.file.mime_type, "size": size, "cached": cached}
+            )
+        except ToolFailure as e:
+            out.append({"id": mid, **e.as_dict()})
+        except FloodWaitError as e:
+            out.append({"id": mid, "ok": False, "code": "flood_wait", "error": "FloodWait", "retry_after": e.seconds})
+        except Exception as e:  # noqa: BLE001 — один сбойный файл не должен терять остальные
+            log.warning("download_media: msg=%s failed: %r", mid, e)
+            out.append({"id": mid, "ok": False, "code": "download_failed", "error": f"{type(e).__name__}: {e}"})
+    return out
 
 
-@mcp.tool()
-async def send_to_bot(bot: str, text: str, wait_for_reply: bool = True) -> dict:
+@_tool(read_only=True, idempotent=True)
+async def list_participants(chat: str | int, limit: int = 500) -> list[dict] | dict:
+    """Список участников группы/канала (если список открыт — многие каналы его скрывают).
+
+    limit — от 1 до 10000.
+    """
+    check_range("limit", limit, 1, 10_000)
+    client = await telegram.get()
+    entity = await resolve_entity(client, chat)
+    try:
+        return [
+            {
+                "id": u.id,
+                "username": u.username,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "is_bot": u.bot,
+            }
+            async for u in client.iter_participants(entity, limit=limit)
+        ]
+    except ChatAdminRequiredError:
+        raise ToolFailure("hidden", "список участников скрыт — нужны права администратора") from None
+
+
+@_tool(read_only=False)
+async def send_to_bot(bot: str | int, text: str, wait_for_reply: bool = True) -> dict:
     """Отправить сообщение/команду боту (например /start) и дождаться его ответа.
 
-    Возвращает текст ответа и кнопки (если есть), чтобы следующим шагом можно было
-    позвать click_button с нужной подписью кнопки.
+    Только для ботов: людям и в группы инструмент не пишет (code=not_a_bot).
+    Команды одному боту выполняются по очереди; ответом считается сообщение бота после
+    этой команды. Возвращает текст ответа и кнопки (если есть), чтобы следующим шагом
+    можно было позвать click_button с нужной подписью кнопки.
     """
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(bot))
-        reply_box: dict[str, Any] = {}
-        done = asyncio.Event()
-
-        if wait_for_reply:
-            from telethon import events
-
-            @client.on(events.NewMessage(from_users=entity))
-            async def _handler(event):  # noqa: ANN001
-                reply_box["message"] = event.message
-                done.set()
-
-        await retry_on_flood(lambda: client.send_message(entity, text))
-        result: dict[str, Any] = {"sent": text, "bot": bot}
-
-        if wait_for_reply:
-            try:
-                await asyncio.wait_for(done.wait(), timeout=_BOT_WAIT_TIMEOUT_S)
-                m = reply_box["message"]
-                result["reply"] = _format_bot_message(m)
-            except TimeoutError:
-                result["reply"] = None
-                result["note"] = f"бот не ответил за {_BOT_WAIT_TIMEOUT_S}с"
-        return result
-    finally:
-        await client.disconnect()
+    client = await telegram.get()
+    entity = await resolve_bot(client, bot)
+    result = await bots.send_command(client, entity, text, wait_for_reply)
+    result["bot"] = bot
+    return result
 
 
-def _format_bot_message(m) -> dict:  # noqa: ANN001
-    buttons = []
-    if m.buttons:
-        for row_i, row in enumerate(m.buttons):
-            for col_i, b in enumerate(row):
-                buttons.append({"row": row_i, "col": col_i, "text": b.text})
-    return {
-        "message_id": m.id,
-        "date": _iso(m.date),
-        "text": m.message or None,
-        "buttons": buttons,
-    }
+@_tool(read_only=True, idempotent=True)
+async def get_recent_bot_messages(bot: str | int, limit: int = 10) -> list[dict] | dict:
+    """Последние сообщения в диалоге с ботом — посмотреть состояние перед click_button. limit — от 1 до 100."""
+    check_range("limit", limit, 1, 100)
+    client = await telegram.get()
+    entity = await resolve_bot(client, bot)
+    return [bots.format_bot_message(m) async for m in client.iter_messages(entity, limit=limit)]
 
 
-@mcp.tool()
-async def get_recent_bot_messages(bot: str, limit: int = 10) -> list[dict]:
-    """Последние сообщения от бота в этом диалоге — посмотреть состояние перед click_button."""
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(bot))
-        out = []
-        async for m in client.iter_messages(entity, limit=limit):
-            out.append(_format_bot_message(m))
-        return out
-    finally:
-        await client.disconnect()
-
-
-@mcp.tool()
-async def click_button(bot: str, message_id: int, button_text: str, wait_for_reply: bool = True) -> dict:
+@_tool(read_only=False)
+async def click_button(bot: str | int, message_id: int, button_text: str, wait_for_reply: bool = True) -> dict:
     """Нажать inline-кнопку на конкретном сообщении бота (по видимому тексту кнопки).
 
     message_id берите из send_to_bot / get_recent_bot_messages.
     Возвращает результат нажатия: новое/изменённое сообщение бота, если дождались.
     """
-    client = await _get_client()
-    try:
-        entity = await retry_on_flood(lambda: client.get_entity(bot))
-        msgs = await retry_on_flood(lambda: client.get_messages(entity, ids=message_id))
-        if not msgs:
-            return {"ok": False, "error": f"сообщение {message_id} не найдено"}
-        m = msgs
-        if not m.buttons:
-            return {"ok": False, "error": "у этого сообщения нет кнопок"}
-
-        reply_box: dict[str, Any] = {}
-        done = asyncio.Event()
-        if wait_for_reply:
-            from telethon import events
-
-            @client.on(events.NewMessage(from_users=entity))
-            async def _h_new(event):  # noqa: ANN001
-                reply_box["message"] = event.message
-                done.set()
-
-            @client.on(events.MessageEdited(chats=entity))
-            async def _h_edit(event):  # noqa: ANN001
-                if event.message.id == message_id:
-                    reply_box["message"] = event.message
-                    done.set()
-
-        try:
-            await retry_on_flood(lambda: m.click(text=button_text))
-        except ValueError:
-            available = [b.text for row in m.buttons for b in row]
-            return {"ok": False, "error": f"кнопка {button_text!r} не найдена", "available_buttons": available}
-
-        result: dict[str, Any] = {"ok": True, "clicked": button_text}
-        if wait_for_reply:
-            try:
-                await asyncio.wait_for(done.wait(), timeout=_BOT_WAIT_TIMEOUT_S)
-                result["result"] = _format_bot_message(reply_box["message"])
-            except TimeoutError:
-                result["result"] = None
-                result["note"] = f"не дождались ответа за {_BOT_WAIT_TIMEOUT_S}с"
-        return result
-    finally:
-        await client.disconnect()
+    client = await telegram.get()
+    entity = await resolve_bot(client, bot)
+    return await bots.click(client, entity, message_id, button_text, wait_for_reply)
 
 
 if __name__ == "__main__":
