@@ -1,0 +1,8 @@
+.venv/
+data/
+logs/
+.env
+*.session
+*.session-journal
+__pycache__/
+.mcp.json

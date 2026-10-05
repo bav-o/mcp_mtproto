@@ -1,0 +1,3 @@
+app/flood.py — функція retry_on_flood запозичена з проєкту TGgrabber
+(https://github.com/Magerko/TGgrabber, ліцензія MIT) і трохи адаптована.
+Оригінальне повідомлення про авторські права зберігається за посиланням вище.
