@@ -38,5 +38,5 @@ def test_stdio_initialize_and_list_tools():
 
 
 def test_requirements_pin_mcp_1x():
-    reqs = (ROOT / "requirements.txt").read_text()
+    reqs = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "mcp>=" in reqs and ",<2" in reqs.split("mcp>=")[1].splitlines()[0]
