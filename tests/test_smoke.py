@@ -11,7 +11,7 @@ from mcp.client.stdio import stdio_client
 ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_TOOLS = {
-    "list_dialogs", "join_channel", "get_history", "search_messages", "export_chat_md", "export_status",
+    "list_dialogs", "join_channel", "get_history", "search_messages", "list_topics", "export_chat_md", "export_status",
     "export_resume", "export_cancel", "download_media", "list_participants", "send_to_bot",
     "get_recent_bot_messages", "click_button",
 }

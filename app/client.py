@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from contextlib import suppress
 from pathlib import Path
 from typing import IO, Any
@@ -186,10 +187,17 @@ class TelegramService:
         await self.close()
 
 
+_PRIVATE_LINK_RE = re.compile(r"^(?:https?://)?t\.me/c/(\d+)(?:/.*)?$")
+
+
 def parse_chat(chat: str | int) -> str | int:
-    """Строку из цифр ("-100123…") превращает в int: иначе Telethon ищет её как username/телефон."""
-    if isinstance(chat, str) and chat.strip().lstrip("-").isdigit():
-        return int(chat.strip())
+    """Строку из цифр ("-100123…") превращает в int: иначе Telethon ищет её как username/телефон.
+    Ссылку на приватную группу t.me/c/<id>/… — в id вида -100<id>."""
+    if isinstance(chat, str):
+        if chat.strip().lstrip("-").isdigit():
+            return int(chat.strip())
+        if m := _PRIVATE_LINK_RE.match(chat.strip()):
+            return int(f"-100{m.group(1)}")
     return chat
 
 

@@ -18,7 +18,7 @@ retry_after). Прерванное/приостановленное задани
 MCP-сервер запускает задания в фоне (export_chat_md / export_status / export_resume /
 export_cancel). Из терминала (когда MCP-сервер не запущен — сессией владеет один процесс):
     python -m app.export <chat> [--since 2026-01-01] [--until 2026-10-01]
-                                [--max-words 400000] [--max-mb 10] [--by-month]
+                                [--max-words 400000] [--max-mb 10] [--by-month] [--topic ID]
     python -m app.export --resume <job_id>
     python -m app.export --list
 chat — id, @username или ссылка t.me/...
@@ -45,6 +45,7 @@ from telethon.tl.types import Channel, Chat, MessageService, User
 from telethon.utils import get_peer_id
 
 from app.client import DATA_DIR, SessionLock, TelegramService, resolve_entity
+from app import topics
 from app.common import ToolFailure, parse_range, read_json, write_json_atomic
 
 log = logging.getLogger("tg-collector")
@@ -285,10 +286,14 @@ async def create_job(
     max_words: int = DEFAULT_MAX_WORDS,
     max_mb: float = DEFAULT_MAX_MB,
     by_month: bool = False,
+    topic_id: int | None = None,
 ) -> dict:
     max_bytes = _validate_limits(max_words, max_mb)
     parse_range(since, until)
     entity = await resolve_entity(client, chat)
+    title = _display_name(entity)
+    if topic_id is not None:
+        title = f"{title} / {await topics.topic_title(client, entity, topic_id)}"
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     while True:  # уникальный id даже для запусков в одну и ту же секунду
         job_id = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
@@ -302,7 +307,8 @@ async def create_job(
         "job_id": job_id,
         "chat": chat,
         "peer_id": get_peer_id(entity),
-        "title": _display_name(entity),
+        "title": title,
+        "topic_id": topic_id,
         "since": since,
         "until": until,
         "max_words": max_words,
@@ -336,7 +342,7 @@ async def _collect(
             # offset_date исключающий: берём на секунду раньше, точную границу режем сами
             kwargs["offset_date"] = since_dt - timedelta(seconds=1)
         try:
-            async for m in client.iter_messages(entity, **kwargs):
+            async for m in topics.iter_messages(client, entity, state.get("topic_id"), **kwargs):
                 last_seen = m.id
                 if since_dt and m.date < since_dt:
                     continue
@@ -370,6 +376,7 @@ def _publish(state: dict) -> None:
             "job_id": state["job_id"],
             "chat": state["title"],
             "peer_id": state["peer_id"],
+            "topic_id": state.get("topic_id"),
             "since": state["since"],
             "until": state["until"],
             "messages": state["messages"],
@@ -560,6 +567,7 @@ async def _main() -> None:
     p.add_argument("--max-words", type=int, default=DEFAULT_MAX_WORDS, help=f"слов на часть (по умолчанию {DEFAULT_MAX_WORDS})")
     p.add_argument("--max-mb", type=float, default=DEFAULT_MAX_MB, help=f"МБ на часть (по умолчанию {DEFAULT_MAX_MB})")
     p.add_argument("--by-month", action="store_true", help="дополнительно начинать новую часть с каждого месяца")
+    p.add_argument("--topic", type=int, metavar="ID", help="только одна тема форум-группы (id из list_topics)")
     p.add_argument("--resume", metavar="JOB_ID", help="продолжить прерванную/приостановленную выгрузку")
     p.add_argument("--list", action="store_true", help="показать последние задания выгрузки")
     args = p.parse_args()
@@ -576,7 +584,7 @@ async def _main() -> None:
                 job_id = args.resume
             else:
                 params = dict(since=args.since, until=args.until, max_words=args.max_words, max_mb=args.max_mb)
-                job_id = (await create_job(client, args.chat, by_month=args.by_month, **params))["job_id"]
+                job_id = (await create_job(client, args.chat, by_month=args.by_month, topic_id=args.topic, **params))["job_id"]
                 print(f"Задание {job_id} создано")
             try:
                 # в терминале таймаута MCP нет — пережидаем FloodWait до суток

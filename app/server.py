@@ -38,7 +38,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 from telethon.tl.types import Channel, Chat, User
 from telethon.utils import get_peer_id
 
-from app import bots
+from app import bots, topics
 from app.client import TelegramService, resolve_bot, resolve_entity
 from app.common import ToolFailure, check_range, iso, parse_range
 from app.export import DEFAULT_MAX_MB, DEFAULT_MAX_WORDS, ExportManager
@@ -64,7 +64,7 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 mcp = FastMCP("tg-collector", lifespan=_lifespan)
 
 _MAX_MEDIA_PER_CALL = 50
-_MAX_MEDIA_SIZE_MB = 1536  # 1,5 ГБ
+_MAX_MEDIA_SIZE_MB = 4096  # 4 ГБ — максимум файла в Telegram (Premium)
 _MAX_EXPORT_WAIT_S = 50
 
 
@@ -107,8 +107,10 @@ def _entity_kind(e: Any) -> str:
     return "unknown"
 
 
-def _message_row(m: Any, with_sender: bool = True) -> dict:
+def _message_row(m: Any, with_sender: bool = True, forum: bool = False) -> dict:
     row: dict[str, Any] = {"id": m.id, "date": iso(m.date), "sender_id": m.sender_id}
+    if forum:
+        row["topic_id"] = topics.topic_of(m)
     if with_sender:
         s = m.sender
         row["sender"] = (getattr(s, "username", None) or getattr(s, "first_name", None)) if s else None
@@ -195,10 +197,13 @@ async def get_history(
     until: str | None = None,
     limit: int = 200,
     before_id: int | None = None,
+    topic_id: int | None = None,
 ) -> list[dict] | dict:
     """История сообщений чата за период [since, until), от старых к новым.
 
     chat — id, @username или ссылка t.me/...
+    topic_id — только одна тема (вкладка) форум-группы; id тем — из list_topics. В форум-группе
+    у каждого сообщения есть поле topic_id.
     since/until — ISO-даты ("2026-09-01" или "2026-09-01T00:00:00"), можно опустить любую;
     since включительно, until — нет.
     limit — от 1 до 5000 (защита от случайной выгрузки всей истории разом; для всего чата —
@@ -214,22 +219,24 @@ async def get_history(
     kwargs: dict[str, Any] = {"limit": limit, "offset_date": until_dt}
     if before_id:
         kwargs["offset_id"] = before_id
-    async for m in client.iter_messages(entity, **kwargs):
+    forum = topics.is_forum(entity)
+    async for m in topics.iter_messages(client, entity, topic_id, **kwargs):
         if since_dt and m.date and m.date < since_dt:
             break
-        out.append(_message_row(m))
+        out.append(_message_row(m, forum=forum))
     out.reverse()
     return out
 
 
 @_tool(read_only=True, idempotent=True)
 async def search_messages(
-    chat: str | int, query: str, limit: int = 100, before_id: int | None = None
+    chat: str | int, query: str, limit: int = 100, before_id: int | None = None, topic_id: int | None = None
 ) -> list[dict] | dict:
     """Поиск сообщений по ключевым словам внутри одного чата (серверный поиск Telegram).
 
     limit — от 1 до 1000. before_id — продолжение: только сообщения с id меньше этого
     (наименьший id из предыдущего ответа).
+    topic_id — искать только в одной теме (вкладке) форум-группы; id тем — из list_topics.
     """
     check_range("limit", limit, 1, 1000)
     client = await telegram.get()
@@ -237,7 +244,30 @@ async def search_messages(
     kwargs: dict[str, Any] = {"search": query, "limit": limit}
     if before_id:
         kwargs["offset_id"] = before_id
-    return [_message_row(m, with_sender=False) async for m in client.iter_messages(entity, **kwargs)]
+    forum = topics.is_forum(entity)
+    return [
+        _message_row(m, with_sender=False, forum=forum)
+        async for m in topics.iter_messages(client, entity, topic_id, **kwargs)
+    ]
+
+
+@_tool(read_only=True, idempotent=True)
+async def list_topics(chat: str | int, with_counts: bool = True) -> list[dict] | dict:
+    """Темы (вкладки) форум-группы: id, название, закреплена/закрыта, последнее сообщение.
+
+    id темы передавайте как topic_id в get_history, search_messages и export_chat_md.
+    with_counts — добавить messages (сколько сообщений в теме; по запросу на тему,
+    для General Telegram счётчик не отдаёт — null).
+    """
+    client = await telegram.get()
+    entity = await resolve_entity(client, chat)
+    out = []
+    for t in await topics.fetch_topics(client, entity):
+        row = topics.topic_row(t)
+        if with_counts:
+            row["messages"] = await topics.count_messages(client, entity, t.id)
+        out.append(row)
+    return out
 
 
 @_tool(read_only=False)
@@ -249,6 +279,7 @@ async def export_chat_md(
     max_mb: float = DEFAULT_MAX_MB,
     by_month: bool = False,
     wait_seconds: int = 20,
+    topic_id: int | None = None,
 ) -> dict:
     """Выгрузить историю чата в Markdown-файлы на диск, разбив на части. Работает в фоне.
 
@@ -260,6 +291,7 @@ async def export_chat_md(
     и 10 МБ — подходит для NotebookLM (до 500 тыс. слов на источник) и Perplexity.
     Сообщение больше лимита идёт отдельной частью и попадает в oversized_parts.
     by_month — дополнительно начинать новую часть с каждого месяца.
+    topic_id — выгрузить только одну тему (вкладку) форум-группы; id тем — из list_topics.
     wait_seconds — сколько ждать завершения в этом вызове (0–50). Если не успело —
     вернётся status=running и job_id: проверяйте export_status(job_id).
     Возвращает пути к файлам, а не их содержимое — читайте их через Read.
@@ -274,6 +306,7 @@ async def export_chat_md(
         max_words=max_words,
         max_mb=max_mb,
         by_month=by_month,
+        topic_id=topic_id,
     )
 
 
